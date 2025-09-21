@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2025, Sviluppato per Utente AI"
 #property link      "https://www.google.com"
-#property version   "2.0" // --- MODIFICATO --- Versione con Filtro Pendenza MA
+#property version   "2.1" // --- MODIFICATO --- Versione con Filtro Pendenza MA e Gestione Multi-Regime
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -15,16 +15,19 @@ CTrade trade;
 
 // --- Parametri Globali
 input group           "Global Settings"
-input double          InpRiskPercent       = 1.5;         // InpRiskPercent Rischio percentuale per trade
-input ulong           InpMagicNumber       = 666;       // InpMagicNumber Magic Number per questo EA
+input double          InpRiskPercent       = 1.0;         // InpRiskPercent Rischio percentuale per trade (riallineato ai test utente)
+input ulong           InpMagicNumber       = 13579;       // InpMagicNumber Magic Number predefinito per i trade monitorati
 input uint            InpSlippage          = 10;          // InpSlippage Slippage massimo in punti
 
 // --- MODIFICATO: Parametri Filtro Regime (Pendenza Media Mobile) ---
 input group           "Market Regime Filter"
-input int             InpMA_Filter_Period    = 200;         // InpMA_Filter_Period Periodo della media mobile per il filtro
+input int             InpMA_Filter_Period    = 220;         // InpMA_Filter_Period Periodo della media mobile per il filtro di regime
 input ENUM_MA_METHOD  InpMA_Filter_Method    = MODE_EMA;    // InpMA_Filter_Method Metodo della media mobile (SMA, EMA, etc.)
-input int             InpMA_Slope_Period     = 10;          // InpMA_Slope_Period Su quante barre calcolare la pendenza
-input double          InpMA_Slope_Threshold  = 1.0;         // InpMA_Slope_Threshold Pendenza minima (in Punti/Barra) per definire un trend
+input ENUM_TIMEFRAMES InpRegime_Timeframe    = PERIOD_M15;  // --- NUOVO --- Timeframe di riferimento per valutare il regime
+input int             InpMA_Slope_Period     = 20;          // InpMA_Slope_Period Barre da confrontare per il calcolo della pendenza
+input int             InpMA_Slope_ATR_Period = 14;          // --- NUOVO --- Periodo ATR per normalizzare la pendenza
+input double          InpMA_Slope_FlatThresh = 0.35;        // --- NUOVO --- Soglia normalizzata sotto cui il mercato è considerato flat
+input double          InpMA_Slope_TrendThresh= 0.8;         // --- NUOVO --- Soglia normalizzata sopra cui il mercato è considerato in trend
 
 // --- Parametri Logica TREND (Momentum Breakout)
 input group           "Trend Strategy Settings"
@@ -35,21 +38,26 @@ input double          InpTS_ATR_Multiplier_Trend = 2.0;   // InpTS_ATR_Multiplie
 
 // --- Parametri Logica RANGE (Mean Reversion)
 input group           "Range Strategy Settings"
-input int             InpBB_Period         = 26;          // InpBB_Period Periodo delle Bande di Bollinger
-input double          InpBB_Deviation      = 2.0;         // InpBB_Deviation Deviazione delle Bande di Bollinger
-input int             InpRSI_Period        = 12;          // InpRSI_Period Periodo dell'RSI
-input double          InpRSI_Overbought    = 70.0;        // InpRSI_Overbought Livello Ipercomprato RSI
-input double          InpRSI_Oversold      = 30.0;        // InpRSI_Oversold Livello Ipervenduto RSI
+input int             InpBB_Period         = 24;          // InpBB_Period Periodo delle Bande di Bollinger (riallineato ai test utente)
+input double          InpBB_Deviation      = 2.3;         // InpBB_Deviation Deviazione delle Bande di Bollinger
+input int             InpRSI_Period        = 14;          // InpRSI_Period Periodo dell'RSI
+input double          InpRSI_Overbought    = 65.0;        // InpRSI_Overbought Livello Ipercomprato RSI
+input double          InpRSI_Oversold      = 20.0;        // InpRSI_Oversold Livello Ipervenduto RSI
 input int             InpATR_Period_Range  = 14;          // InpATR_Period_Range Periodo ATR per la logica Range
-input double          InpSL_ATR_Multiplier_Range = 1.25;  // InpSL_ATR_Multiplier_Range Moltiplicatore ATR per lo Stop Loss (Range)
-input double          InpTP_Multiplier_Range = 3.0;     // InpTP_Multiplier_Range Moltiplicatore Rischio/Rendimento per il Take Profit
+input double          InpSL_ATR_Multiplier_Range = 1.0;   // InpSL_ATR_Multiplier_Range Moltiplicatore ATR per lo Stop Loss (Range)
+input double          InpTP_Multiplier_Range = 2.2;       // --- MODIFICATO --- Rapporto TP meno ambizioso per aumentare l'hit-rate
+input double          InpRange_BreakEvenRR = 0.7;         // --- NUOVO --- Livello (in R) dove spostare lo stop a pareggio sui trade range
+input double          InpRange_BE_Buffer   = 0.2;         // --- NUOVO --- Buffer in R oltre il punto di pareggio
+input int             InpRange_MaxBarsInTrade = 36;       // --- NUOVO --- Numero massimo di barre da mantenere un trade range aperto
+input double          InpRange_ATR_VolatilityCap = 1.6;   // --- NUOVO --- Limite di volatilità (ATR corrente / ATR medio) per attivare la logica range
 
 // --- NUOVO: Enumerazioni per la chiarezza del codice ---
 enum ENUM_MARKET_REGIME
 {
-    REGIME_UPTREND,     // Pendenza MA positiva
-    REGIME_DOWNTREND,   // Pendenza MA negativa
-    REGIME_FLAT         // Pendenza MA piatta
+    REGIME_UPTREND,       // Pendenza MA positiva oltre la soglia trend
+    REGIME_DOWNTREND,     // Pendenza MA negativa oltre la soglia trend
+    REGIME_FLAT,          // Pendenza normalizzata entro la zona neutra
+    REGIME_TRANSITION     // --- NUOVO --- Zona di transizione: nessun nuovo trade
 };
 
 enum ENUM_TRADE_DIRECTION
@@ -67,10 +75,24 @@ enum ENUM_DONCHIAN_MODE
 
 // --- Handles degli indicatori
 int maFilterHandle; // --- NUOVO ---
+int atrHandleSlope; // --- NUOVO --- ATR per normalizzare la pendenza
 int atrHandleTrend;
 int bbandsHandle;
 int rsiHandle;
 int atrHandleRange;
+
+// --- NUOVO: Gestione sessioni e limiti ---
+input group           "Session & Risk Controls"
+input bool            InpUseSessionFilter   = true;        // --- NUOVO --- Abilita il filtro orario
+input string          InpSessionStart       = "07:00";     // --- NUOVO --- Orario di inizio trading (HH:MM, server)
+input string          InpSessionEnd         = "19:00";     // --- NUOVO --- Orario di fine trading (HH:MM, server)
+
+// --- NUOVO: Prototipi delle funzioni helper ---
+void ManageTrendPosition();
+void ManageRangePosition();
+bool RangeVolatilityFilter();
+bool IsWithinTradingSession();
+int  ParseTimeToMinutes(const string timeStr);
 
 //+------------------------------------------------------------------+
 //| Funzione di Inizializzazione dell'Expert                       |
@@ -85,10 +107,17 @@ int OnInit()
     Print(AccountInfoInteger(ACCOUNT_MARGIN_MODE));
 
     //--- MODIFICATO: Ottenimento handle del filtro MA
-    maFilterHandle = iMA(_Symbol, _Period, InpMA_Filter_Period, 0, InpMA_Filter_Method, PRICE_CLOSE);
+    maFilterHandle = iMA(_Symbol, InpRegime_Timeframe, InpMA_Filter_Period, 0, InpMA_Filter_Method, PRICE_CLOSE); // --- MODIFICATO --- filtro su TF superiore
     if(maFilterHandle == INVALID_HANDLE)
     {
         printf("Errore nell'ottenere l'handle MA Filter: %d", GetLastError());
+        return(INIT_FAILED);
+    }
+
+    atrHandleSlope = iATR(_Symbol, InpRegime_Timeframe, InpMA_Slope_ATR_Period); // --- NUOVO --- handle ATR per normalizzare la pendenza
+    if(atrHandleSlope == INVALID_HANDLE)
+    {
+        printf("Errore nell'ottenere l'handle ATR (Slope): %d", GetLastError());
         return(INIT_FAILED);
     }
 
@@ -120,7 +149,7 @@ int OnInit()
         return(INIT_FAILED);
     }
 
-    printf("EA Multi-Regime v2.0 (Slope Filter) inizializzato con successo.");
+    printf("EA Multi-Regime v2.1 (Slope Filter) inizializzato con successo.");
     return(INIT_SUCCEEDED);
 }
 
@@ -131,6 +160,7 @@ void OnDeinit(const int reason)
 {
     //--- Rilascia gli handles degli indicatori
     IndicatorRelease(maFilterHandle); // --- MODIFICATO ---
+    IndicatorRelease(atrHandleSlope); // --- NUOVO ---
     IndicatorRelease(atrHandleTrend);
     IndicatorRelease(bbandsHandle);
     IndicatorRelease(rsiHandle);
@@ -162,7 +192,7 @@ void OnTick()
            return;
         }
     }
-    
+
     CheckForNewSignal();
 }
 
@@ -189,11 +219,18 @@ void OnTick()
 //+------------------------------------------------------------------+
 void CheckForNewSignal()
 {
+    if(!IsWithinTradingSession())
+    {
+        Print("Sessione fuori orario operativo. Nessun nuovo trade.");
+        return;
+    }
+
+    double slopePointsPerBar;
     // Dichiariamo una variabile per ricevere il valore della pendenza
-    double calculated_slope; 
-    
+    double slopeNormalized;
+
     // Chiamiamo la funzione aggiornata, che ci darà sia il regime sia la pendenza
-    ENUM_MARKET_REGIME regime = GetMarketRegime(calculated_slope);
+    ENUM_MARKET_REGIME regime = GetMarketRegime(slopePointsPerBar, slopeNormalized);
 
     // Usiamo StringFormat per creare un messaggio di log dettagliato e pulito
     string message;
@@ -201,19 +238,28 @@ void CheckForNewSignal()
     switch(regime)
     {
         case REGIME_UPTREND:
-            message = StringFormat("Regim 5M-TEST: UPTREND (Pendenza: %.2f vs Soglia: -%.2f/+%.2f). Filtro attivo, trading disabilitato.", calculated_slope, InpMA_Slope_Threshold, InpMA_Slope_Threshold);
+            message = StringFormat("Regime: UPTREND | slopePts=%.2f | slopeNorm=%.2f | sogliaTrend=%.2f", slopePointsPerBar, slopeNormalized, InpMA_Slope_TrendThresh);
             Print(message);
+            CheckTrendSignal(ALLOW_LONGS_ONLY);   // --- NUOVO --- trend in direzione long
+            CheckRangeSignal(ALLOW_LONGS_ONLY);   // --- NUOVO --- mean reversion solo pro-trend
             break;
-            
+
         case REGIME_DOWNTREND:
-            message = StringFormat("Regim 5M-TEST: DOWNTREND (Pendenza: %.2f vs Soglia: -%.2f/+%.2f). Filtro attivo, trading disabilitato.", calculated_slope, InpMA_Slope_Threshold, InpMA_Slope_Threshold);
+            message = StringFormat("Regime: DOWNTREND | slopePts=%.2f | slopeNorm=%.2f | sogliaTrend=-%.2f", slopePointsPerBar, slopeNormalized, InpMA_Slope_TrendThresh);
             Print(message);
+            CheckTrendSignal(ALLOW_SHORTS_ONLY);  // --- NUOVO --- trend in direzione short
+            CheckRangeSignal(ALLOW_SHORTS_ONLY);  // --- NUOVO --- mean reversion solo pro-trend
             break;
-            
+
         case REGIME_FLAT:
-            message = StringFormat("Regim 5M-TEST: FLAT (Pendenza: %.2f vs Soglia: -%.2f/+%.2f). Controllo segnali Range in corso...", calculated_slope, InpMA_Slope_Threshold, InpMA_Slope_Threshold);
+            message = StringFormat("Regime: FLAT | slopePts=%.2f | slopeNorm=%.2f | sogliaFlat=%.2f", slopePointsPerBar, slopeNormalized, InpMA_Slope_FlatThresh);
             Print(message);
             CheckRangeSignal(ALLOW_ANY);
+            break;
+
+        case REGIME_TRANSITION:
+            message = StringFormat("Regime: TRANSITION | slopePts=%.2f | slopeNorm=%.2f. Nessun nuovo trade.", slopePointsPerBar, slopeNormalized);
+            Print(message);
             break;
     }
 }
@@ -269,7 +315,7 @@ void CheckForNewSignal()
 //+------------------------------------------------------------------+
 //| Determina il regime di mercato e restituisce la pendenza calcolata |
 //+------------------------------------------------------------------+
-ENUM_MARKET_REGIME GetMarketRegime(double &slope_value) // <-- MODIFICA QUI
+ENUM_MARKET_REGIME GetMarketRegime(double &slope_points_per_bar, double &slope_normalized)
 {
     int bars_to_copy = InpMA_Slope_Period + 1;
     double ma_buffer[];
@@ -278,7 +324,8 @@ ENUM_MARKET_REGIME GetMarketRegime(double &slope_value) // <-- MODIFICA QUI
     if(CopyBuffer(maFilterHandle, 0, 0, bars_to_copy, ma_buffer) < bars_to_copy)
     {
         printf("Errore nella copia dei dati del filtro MA: dati insufficienti sul grafico.");
-        slope_value = 0; // In caso di errore, impostiamo la pendenza a 0
+        slope_points_per_bar = 0; // In caso di errore, impostiamo la pendenza a 0
+        slope_normalized = 0;
         return REGIME_FLAT;
     }
 
@@ -287,15 +334,29 @@ ENUM_MARKET_REGIME GetMarketRegime(double &slope_value) // <-- MODIFICA QUI
     double price_diff = ma_now - ma_past;
     double slope = (price_diff / InpMA_Slope_Period) / _Point;
 
-    slope_value = slope; // <-- NUOVA RIGA: Assegniamo il valore calcolato alla variabile di output
+    slope_points_per_bar = slope; // --- MODIFICATO --- restituiamo la pendenza in punti/barra
 
-    if(slope > InpMA_Slope_Threshold)
+    double atr_value = GetIndicatorValue(atrHandleSlope, 0, 1);
+    double atr_points = atr_value > 0 ? atr_value / _Point : 0;
+
+    if(atr_points <= 0)
+    {
+        slope_normalized = 0;
+        return REGIME_FLAT;
+    }
+
+    slope_normalized = slope / atr_points; // --- MODIFICATO --- pendenza normalizzata rispetto all'ATR
+
+    if(slope_normalized > InpMA_Slope_TrendThresh)
         return REGIME_UPTREND;
-        
-    if(slope < -InpMA_Slope_Threshold)
+
+    if(slope_normalized < -InpMA_Slope_TrendThresh)
         return REGIME_DOWNTREND;
-        
-    return REGIME_FLAT;
+
+    if(MathAbs(slope_normalized) <= InpMA_Slope_FlatThresh)
+        return REGIME_FLAT;
+
+    return REGIME_TRANSITION; // --- NUOVO --- area grigia fra flat e trend
 }
 
 //+------------------------------------------------------------------+
@@ -337,10 +398,19 @@ void CheckTrendSignal(ENUM_TRADE_DIRECTION direction_filter)
 // --- MODIFICATO: La funzione ora accetta un filtro direzionale
 void CheckRangeSignal(ENUM_TRADE_DIRECTION direction_filter)
 {
+    if(!RangeVolatilityFilter())
+    {
+        Print("Volatilità eccessiva: logica range sospesa.");
+        return;
+    }
+
     double bbUpper[1], bbLower[1];
     CopyBuffer(bbandsHandle, 1, 1, 1, bbUpper); // Upper Band
     CopyBuffer(bbandsHandle, 2, 1, 1, bbLower); // Lower Band
-    
+
+    double bbMiddle[1];
+    CopyBuffer(bbandsHandle, 0, 1, 1, bbMiddle); // --- NUOVO --- media per trailing dinamico
+
     double rsiValue = GetIndicatorValue(rsiHandle, 0, 1);
     double highPrice = iHigh(_Symbol, _Period, 1);
     double lowPrice  = iLow(_Symbol, _Period, 1);
@@ -351,9 +421,11 @@ void CheckRangeSignal(ENUM_TRADE_DIRECTION direction_filter)
         double atrValue = GetIndicatorValue(atrHandleRange, 0, 1);
         double slDistance = atrValue * InpSL_ATR_Multiplier_Range;
         double tpDistance = slDistance * InpTP_Multiplier_Range;
-        
+
         double stopLossPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - slDistance;
-        double takeProfitPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + tpDistance;
+        double takeProfitPrice = bbMiddle[0]; // --- MODIFICATO --- prima uscita alla banda centrale
+        if(takeProfitPrice <= SymbolInfoDouble(_Symbol, SYMBOL_ASK))
+            takeProfitPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + tpDistance; // fallback in caso di dati inconsistenti
         double lotSize = CalculateLotSize(slDistance);
         trade.Buy(lotSize, _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_ASK), stopLossPrice, takeProfitPrice, "Range_Long");
         printf("IT'S A LONG SIGNAL - BUY");
@@ -366,7 +438,9 @@ void CheckRangeSignal(ENUM_TRADE_DIRECTION direction_filter)
         double tpDistance = slDistance * InpTP_Multiplier_Range;
 
         double stopLossPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID) + slDistance;
-        double takeProfitPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID) - tpDistance;
+        double takeProfitPrice = bbMiddle[0]; // --- MODIFICATO --- prima uscita alla banda centrale
+        if(takeProfitPrice >= SymbolInfoDouble(_Symbol, SYMBOL_BID))
+            takeProfitPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID) - tpDistance; // fallback
         double lotSize = CalculateLotSize(slDistance);
         trade.Sell(lotSize, _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_BID), stopLossPrice, takeProfitPrice, "Range_Short");
         printf("IT'S A SHORT SIGNAL - SELL");
@@ -394,20 +468,31 @@ void ManageOpenPosition()
 {
     if(!PositionSelect(_Symbol)) return;
     string comment = PositionGetString(POSITION_COMMENT);
-    
-    if(StringFind(comment, "Trend") == -1)
-    {
-        return;
-    }
 
+    if(StringFind(comment, "Trend") != -1)
+    {
+        ManageTrendPosition();
+    }
+    else if(StringFind(comment, "Range") != -1)
+    {
+        ManageRangePosition();
+    }
+}
+
+//+------------------------------------------------------------------+
+//| --- NUOVO --- Trailing ATR dinamico per i trade trend            |
+//+------------------------------------------------------------------+
+void ManageTrendPosition()
+{
     ENUM_POSITION_TYPE posType    = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
     double             currentSL  = PositionGetDouble(POSITION_SL);
     double             openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
+    double             currentTP  = PositionGetDouble(POSITION_TP);
     double atrValue = GetIndicatorValue(atrHandleTrend, 0, 1);
     if(atrValue <= 0) return;
 
     double trailDistance = atrValue * InpTS_ATR_Multiplier_Trend;
-    double newSL = 0;
+    double newSL = currentSL;
 
     if(posType == POSITION_TYPE_BUY)
     {
@@ -420,16 +505,163 @@ void ManageOpenPosition()
     else if(posType == POSITION_TYPE_SELL)
     {
         double proposedSL = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + trailDistance;
-        if(proposedSL < currentSL && (proposedSL < openPrice || currentSL == 0))
+        if((currentSL == 0 || proposedSL < currentSL) && proposedSL < openPrice)
         {
             newSL = proposedSL;
         }
     }
-    
-    if(newSL != 0)
+
+    if(newSL != currentSL)
     {
-        trade.PositionModify(_Symbol, newSL, PositionGetDouble(POSITION_TP));
+        trade.PositionModify(_Symbol, newSL, currentTP);
     }
+}
+
+//+------------------------------------------------------------------+
+//| --- NUOVO --- Gestione avanzata dei trade range                  |
+//+------------------------------------------------------------------+
+void ManageRangePosition()
+{
+    ENUM_POSITION_TYPE posType    = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double             currentSL  = PositionGetDouble(POSITION_SL);
+    double             currentTP  = PositionGetDouble(POSITION_TP);
+    double             openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
+    datetime           openTime   = (datetime)PositionGetInteger(POSITION_TIME);
+
+    double riskDistance = 0.0;
+    if(posType == POSITION_TYPE_BUY)
+        riskDistance = openPrice - currentSL;
+    else if(posType == POSITION_TYPE_SELL)
+        riskDistance = currentSL - openPrice;
+
+    if(riskDistance <= 0) return;
+
+    double currentPrice = (posType == POSITION_TYPE_BUY)
+                          ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                          : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+    double profitDistance = (posType == POSITION_TYPE_BUY)
+                            ? currentPrice - openPrice
+                            : openPrice - currentPrice;
+
+    double rMultiple = profitDistance / riskDistance;
+    double newSL = currentSL;
+    double newTP = currentTP;
+
+    // --- Break even dinamico ---
+    if(rMultiple >= InpRange_BreakEvenRR)
+    {
+        double targetSL = (posType == POSITION_TYPE_BUY)
+                          ? openPrice + (riskDistance * InpRange_BE_Buffer)
+                          : openPrice - (riskDistance * InpRange_BE_Buffer);
+
+        if(posType == POSITION_TYPE_BUY && targetSL > currentSL)
+            newSL = targetSL;
+        else if(posType == POSITION_TYPE_SELL && (currentSL == 0 || targetSL < currentSL))
+            newSL = targetSL;
+    }
+
+    // --- Trailing Take Profit verso la banda centrale ---
+    double bbMiddle[1];
+    if(CopyBuffer(bbandsHandle, 0, 1, 1, bbMiddle) > 0)
+    {
+        double desiredTP = bbMiddle[0];
+        if(posType == POSITION_TYPE_BUY && desiredTP > currentPrice && (currentTP == 0 || desiredTP < currentTP))
+            newTP = desiredTP;
+        else if(posType == POSITION_TYPE_SELL && desiredTP < currentPrice && (currentTP == 0 || desiredTP > currentTP))
+            newTP = desiredTP;
+    }
+
+    // --- Stop temporale ---
+    if(InpRange_MaxBarsInTrade > 0)
+    {
+        int barsOpen = (int)((TimeCurrent() - openTime) / PeriodSeconds(_Period));
+        if(barsOpen >= InpRange_MaxBarsInTrade)
+        {
+            Print("Chiusura trade range per timeout.");
+            trade.PositionClose(_Symbol);
+            return;
+        }
+    }
+
+    if(newSL != currentSL || newTP != currentTP)
+    {
+        trade.PositionModify(_Symbol, newSL, newTP);
+    }
+}
+
+//+------------------------------------------------------------------+
+//| --- NUOVO --- Controllo volatilità per la logica range           |
+//+------------------------------------------------------------------+
+bool RangeVolatilityFilter()
+{
+    if(InpRange_ATR_VolatilityCap <= 0)
+        return true;
+
+    double currentATR = GetIndicatorValue(atrHandleRange, 0, 1);
+    if(currentATR <= 0)
+        return true; // In caso di dati insufficienti non blocchiamo l'operatività
+
+    int lookback = MathMax(10, InpATR_Period_Range * 3);
+    double atrBuffer[];
+    ArraySetAsSeries(atrBuffer, true);
+    if(CopyBuffer(atrHandleRange, 0, 1, lookback, atrBuffer) < lookback)
+        return true;
+
+    double sum = 0;
+    for(int i = 0; i < lookback; i++)
+        sum += atrBuffer[i];
+
+    double avgATR = sum / lookback;
+    if(avgATR <= 0)
+        return true;
+
+    double ratio = currentATR / avgATR;
+    return (ratio <= InpRange_ATR_VolatilityCap);
+}
+
+//+------------------------------------------------------------------+
+//| --- NUOVO --- Filtro orario per l'operatività                    |
+//+------------------------------------------------------------------+
+bool IsWithinTradingSession()
+{
+    if(!InpUseSessionFilter)
+        return true;
+
+    MqlDateTime now;
+    TimeToStruct(TimeCurrent(), now);
+    int currentMinutes = now.hour * 60 + now.min;
+
+    int startMinutes = ParseTimeToMinutes(InpSessionStart);
+    int endMinutes   = ParseTimeToMinutes(InpSessionEnd);
+
+    if(startMinutes == endMinutes)
+        return true; // finestra sempre attiva
+
+    if(startMinutes < endMinutes)
+        return (currentMinutes >= startMinutes && currentMinutes <= endMinutes);
+
+    // Finestra che attraversa la mezzanotte
+    return (currentMinutes >= startMinutes || currentMinutes <= endMinutes);
+}
+
+//+------------------------------------------------------------------+
+//| --- NUOVO --- Utility per convertire HH:MM in minuti             |
+//+------------------------------------------------------------------+
+int ParseTimeToMinutes(const string timeStr)
+{
+    string parts[];
+    int count = StringSplit(timeStr, ':', parts);
+    if(count < 2)
+        return 0;
+
+    int hours   = (int)StringToInteger(parts[0]);
+    int minutes = (int)StringToInteger(parts[1]);
+
+    hours   = MathMax(0, MathMin(23, hours));
+    minutes = MathMax(0, MathMin(59, minutes));
+
+    return hours * 60 + minutes;
 }
 
 //+------------------------------------------------------------------+
