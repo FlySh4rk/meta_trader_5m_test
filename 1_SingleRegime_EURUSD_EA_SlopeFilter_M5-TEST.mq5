@@ -321,7 +321,8 @@ ENUM_MARKET_REGIME GetMarketRegime(double &slope_points_per_bar, double &slope_n
     double ma_buffer[];
     ArraySetAsSeries(ma_buffer, true);
 
-    if(CopyBuffer(maFilterHandle, 0, 0, bars_to_copy, ma_buffer) < bars_to_copy)
+    // Copy starting from shift 1 so index 0 corresponds to the last fully closed bar
+    if(CopyBuffer(maFilterHandle, 0, 1, bars_to_copy, ma_buffer) < bars_to_copy)
     {
         printf("Errore nella copia dei dati del filtro MA: dati insufficienti sul grafico.");
         slope_points_per_bar = 0; // In caso di errore, impostiamo la pendenza a 0
@@ -329,6 +330,7 @@ ENUM_MARKET_REGIME GetMarketRegime(double &slope_points_per_bar, double &slope_n
         return REGIME_FLAT;
     }
 
+    // ma_buffer[0] -> shift 1 (ultima barra chiusa), ma_buffer[InpMA_Slope_Period] -> shift 1 + periodo
     double ma_now = ma_buffer[0];
     double ma_past = ma_buffer[InpMA_Slope_Period];
     double price_diff = ma_now - ma_past;
