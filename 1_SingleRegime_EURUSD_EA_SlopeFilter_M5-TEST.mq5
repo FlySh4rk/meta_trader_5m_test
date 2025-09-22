@@ -13,6 +13,88 @@
 // --- Oggetti globali
 CTrade trade;
 
+struct RangeRiskRecord
+{
+    ulong  ticket;
+    double distance;
+};
+
+RangeRiskRecord rangeRiskRecords[];
+
+int FindRangeRiskRecordIndex(const ulong ticket)
+{
+    int size = ArraySize(rangeRiskRecords);
+    for(int i = 0; i < size; ++i)
+    {
+        if(rangeRiskRecords[i].ticket == ticket)
+            return i;
+    }
+    return -1;
+}
+
+void StoreRangeRiskDistance(const ulong ticket, const double distance)
+{
+    if(ticket == 0 || distance <= 0.0)
+        return;
+
+    int idx = FindRangeRiskRecordIndex(ticket);
+    if(idx == -1)
+    {
+        int newIndex = ArraySize(rangeRiskRecords);
+        ArrayResize(rangeRiskRecords, newIndex + 1);
+        rangeRiskRecords[newIndex].ticket = ticket;
+        rangeRiskRecords[newIndex].distance = distance;
+    }
+    else
+    {
+        rangeRiskRecords[idx].distance = distance;
+    }
+}
+
+bool GetRangeRiskDistance(const ulong ticket, double &distance)
+{
+    int idx = FindRangeRiskRecordIndex(ticket);
+    if(idx == -1)
+        return false;
+
+    distance = rangeRiskRecords[idx].distance;
+    return true;
+}
+
+void RemoveRangeRiskDistance(const ulong ticket)
+{
+    int size = ArraySize(rangeRiskRecords);
+    if(size <= 0)
+        return;
+
+    for(int i = 0; i < size; ++i)
+    {
+        if(rangeRiskRecords[i].ticket == ticket)
+        {
+            int lastIndex = size - 1;
+            if(i != lastIndex)
+                rangeRiskRecords[i] = rangeRiskRecords[lastIndex];
+            ArrayResize(rangeRiskRecords, lastIndex);
+            return;
+        }
+    }
+}
+
+void PurgeClosedRangeRiskRecords()
+{
+    int i = 0;
+    while(i < ArraySize(rangeRiskRecords))
+    {
+        ulong ticket = rangeRiskRecords[i].ticket;
+        if(ticket == 0 || !PositionSelectByTicket(ticket))
+        {
+            RemoveRangeRiskDistance(ticket);
+            continue;
+        }
+        ++i;
+    }
+}
+
 // --- Parametri Globali
 input group           "Global Settings"
 input double          InpRiskPercent       = 1.0;         // InpRiskPercent Rischio percentuale per trade (riallineato ai test utente)
@@ -173,6 +255,8 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+    PurgeClosedRangeRiskRecords();
+
     MqlRates rates[1];
     static datetime lastBarTime = 0;
     if(CopyRates(_Symbol, _Period, 0, 1, rates) < 1)
@@ -191,6 +275,10 @@ void OnTick()
            ManageOpenPosition();
            return;
         }
+    }
+    else
+    {
+        PurgeClosedRangeRiskRecords();
     }
 
     CheckForNewSignal();
@@ -466,7 +554,11 @@ void CheckRangeSignal(ENUM_TRADE_DIRECTION direction_filter)
 //+------------------------------------------------------------------+
 void ManageOpenPosition()
 {
-    if(!PositionSelect(_Symbol)) return;
+    if(!PositionSelect(_Symbol))
+    {
+        PurgeClosedRangeRiskRecords();
+        return;
+    }
     string comment = PositionGetString(POSITION_COMMENT);
 
     if(StringFind(comment, "Trend") != -1)
@@ -527,14 +619,18 @@ void ManageRangePosition()
     double             currentTP  = PositionGetDouble(POSITION_TP);
     double             openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
     datetime           openTime   = (datetime)PositionGetInteger(POSITION_TIME);
+    ulong              ticket     = (ulong)PositionGetInteger(POSITION_TICKET);
 
-    double riskDistance = 0.0;
-    if(posType == POSITION_TYPE_BUY)
-        riskDistance = openPrice - currentSL;
-    else if(posType == POSITION_TYPE_SELL)
-        riskDistance = currentSL - openPrice;
+    double storedRiskDistance = 0.0;
+    if(!GetRangeRiskDistance(ticket, storedRiskDistance))
+    {
+        storedRiskDistance = MathAbs(openPrice - currentSL);
+        if(storedRiskDistance > 0.0)
+            StoreRangeRiskDistance(ticket, storedRiskDistance);
+    }
 
-    if(riskDistance <= 0) return;
+    if(storedRiskDistance <= 0.0)
+        storedRiskDistance = MathAbs(openPrice - currentSL);
 
     double currentPrice = (posType == POSITION_TYPE_BUY)
                           ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
@@ -544,16 +640,19 @@ void ManageRangePosition()
                             ? currentPrice - openPrice
                             : openPrice - currentPrice;
 
-    double rMultiple = profitDistance / riskDistance;
+    bool   hasRiskReference = (storedRiskDistance > 0.0);
+    double rMultiple = 0.0;
+    if(hasRiskReference)
+        rMultiple = profitDistance / storedRiskDistance;
     double newSL = currentSL;
     double newTP = currentTP;
 
     // --- Break even dinamico ---
-    if(rMultiple >= InpRange_BreakEvenRR)
+    if(hasRiskReference && rMultiple >= InpRange_BreakEvenRR)
     {
         double targetSL = (posType == POSITION_TYPE_BUY)
-                          ? openPrice + (riskDistance * InpRange_BE_Buffer)
-                          : openPrice - (riskDistance * InpRange_BE_Buffer);
+                          ? openPrice + (storedRiskDistance * InpRange_BE_Buffer)
+                          : openPrice - (storedRiskDistance * InpRange_BE_Buffer);
 
         if(posType == POSITION_TYPE_BUY && targetSL > currentSL)
             newSL = targetSL;
@@ -580,6 +679,7 @@ void ManageRangePosition()
         {
             Print("Chiusura trade range per timeout.");
             trade.PositionClose(_Symbol);
+            RemoveRangeRiskDistance(ticket);
             return;
         }
     }
